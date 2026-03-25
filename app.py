@@ -192,6 +192,17 @@ class CommandProcessor:
                 r"detect objects"
             ],
             
+            # Capture face command
+            "capture": [
+                r"capture image",
+                r"capture face",
+                r"take photo",
+                r"add face",
+                r"save face",
+                r"add new face",
+                r"register face"
+            ],
+
             # Face/Money Detection Additions
             "recognition": [
                 r"recognize face",
@@ -589,6 +600,65 @@ def send_email_alert(location, maps_link):
 def home():
     return render_template('index.html')
 
+# ==================== FACE CAPTURE ENDPOINT ====================
+@app.route('/api/capture-face', methods=['POST'])
+def capture_face_api():
+    """Save a captured face frame to known_faces/<name>.jpg"""
+    try:
+        data = request.get_json()
+        image_data = data.get('image_data', '')
+        name = data.get('name', '').strip()
+
+        if not name:
+            return jsonify({"status": "error", "message": "No name provided."}), 400
+
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+
+        image_bytes = base64.b64decode(image_data)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            return jsonify({"status": "error", "message": "Invalid image."}), 400
+
+        # Face detection check (lightweight Haar cascade)
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+        if len(faces) == 0:
+            return jsonify({
+                "status": "no_face",
+                "message": "No person detected in the frame. Please position yourself directly in front of the camera and try again."
+            }), 200
+
+        if not os.path.exists("known_faces"):
+            os.makedirs("known_faces")
+
+        # Sanitize name
+        safe_name = name.lower().replace(' ', '_')
+        save_path = os.path.join("known_faces", f"{safe_name}.jpg")
+        cv2.imwrite(save_path, frame)
+
+        # Clear DeepFace cache so it rebuilds with new face
+        for pkl_file in os.listdir("known_faces"):
+            if pkl_file.endswith(".pkl"):
+                try:
+                    os.remove(os.path.join("known_faces", pkl_file))
+                except:
+                    pass
+
+        return jsonify({
+            "status": "success",
+            "message": f"Face saved for {name}.",
+            "path": save_path
+        })
+    except Exception as e:
+        print(f"Capture face error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ==================== NEW: RECOGNITION AND DETECTION ENDPOINTS ====================
 @app.route('/api/recognize-face', methods=['POST'])
 def recognize_face():
@@ -737,7 +807,12 @@ def process_command():
         elif category == "detection":
             response["action"] = "describe_scene"
             response["message"] = "Analyzing what's in front of you"
-        
+
+        # CAPTURE FACE COMMAND
+        elif category == "capture":
+            response["action"] = "start_capture"
+            response["message"] = "Ready to capture. Please look at the camera."
+
         # RECOGNITION COMMANDS (FACE / MONEY)
         elif category == "recognition":
             if "face" in command_text or "who" in command_text:
