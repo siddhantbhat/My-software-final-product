@@ -658,6 +658,9 @@
                         <button class="glass-btn success" onclick="setAppMode('money')" style="flex: 1; font-size: 0.85em; padding: 8px;">
                             <i class="fas fa-money-bill-wave"></i> Money Mode
                         </button>
+                        <button class="glass-btn" id="captureFaceBtn" onclick="startCaptureFlow()" style="flex: 1; font-size: 0.85em; padding: 8px; background: linear-gradient(45deg, #e67e22, #d35400);">
+                            <i class="fas fa-camera-retro"></i> Capture Face
+                        </button>
                     </div>
                     <ul class="object-list" id="objectList">
                         <li class="object-item">No objects detected</li>
@@ -774,11 +777,13 @@
 
             <!-- Command List -->
             <div class="command-list">
-                <h4><i class="fas fa-list"></i> How to Use Standard Mode:</h4>
+                <h4><i class="fas fa-microphone-alt" style="color:#06d6a0"></i> Always Listening on Both Tabs:</h4>
                 <ul>
-                    <li><i class="fas fa-circle"></i> Click "Start Listening" to speak commands</li>
-                    <li><i class="fas fa-circle"></i> Click "Stop Listening" to end</li>
-                    <li><i class="fas fa-circle"></i> Say: "recognize face", "detect money", "start camera", etc.</li>
+                    <li><i class="fas fa-circle"></i> Say <strong>"My Eye"</strong> followed by any command — always active</li>
+                    <li><i class="fas fa-circle"></i> "My Eye, capture image" — capture &amp; save face by voice</li>
+                    <li><i class="fas fa-circle"></i> "My Eye, recognize face" — switch to face mode</li>
+                    <li><i class="fas fa-circle"></i> "My Eye, detect money" / "start camera" / "emergency"</li>
+                    <li><i class="fas fa-circle"></i> Use <em>Start Listening</em> button for quick one-off commands</li>
                 </ul>
             </div>
         </div>
@@ -799,6 +804,7 @@
                     Just say "My Eye" followed by any command:<br>
                     • "My Eye, recognize face"<br>
                     • "My Eye, detect money"<br>
+                    • "My Eye, capture image"<br>
                     • "My Eye, navigate to Hadapsar"<br>
                     • "My Eye, start camera"<br>
                     • "My Eye, upload document"<br>
@@ -830,6 +836,12 @@
         let isCameraActive = false;
         let detectionMode = 'normal';
         let lastDescription = "";
+        let isVoicePaused = false;
+
+        // Capture face state machine
+        let captureState = 'idle'; // 'idle' | 'waiting_name'
+        let capturedImageData = null;
+        let nameRecognition = null;
         
         // Voice control
         let isListening = false;
@@ -851,19 +863,19 @@
             if (tabNum === 1) {
                 document.getElementById('tab1').classList.add('active');
                 document.getElementById('tab1Btn').classList.add('active');
-                // Stop wake word listening in standard mode
+                // Stop wake word listening when leaving Accessibility Mode
                 if (wakeWordRecognition) {
-                    wakeWordRecognition.stop();
+                    try { wakeWordRecognition.stop(); } catch(e) {}
                 }
             } else {
                 document.getElementById('tab2').classList.add('active');
                 document.getElementById('tab2Btn').classList.add('active');
-                // Stop standard mode listening
-                if (recognition) {
-                    recognition.stop();
+                // Stop manual recognition if active
+                if (recognition && isListening) {
+                    try { recognition.stop(); } catch(e) {}
                     isListening = false;
                 }
-                // Start wake word listening in accessibility mode
+                // Start wake word listening in Accessibility Mode
                 startWakeWordListening();
             }
         }
@@ -890,6 +902,20 @@
             
             recognition.onresult = async function(event) {
                 const command = event.results[0][0].transcript;
+
+                // ---- CAPTURE NAME INTERCEPT ----
+                // If we are waiting for a name after a voice-triggered capture,
+                // the next thing the user says IS the name — no 'My Eye' needed.
+                if (captureState === 'waiting_name' && capturedImageData) {
+                    const spokenName = command.trim();
+                    document.getElementById('voiceTranscript').innerHTML =
+                        `<p>🎤 Name: "<strong>${spokenName}</strong>"</p>`;
+                    document.getElementById('voiceStatus').innerHTML = 'Saving...';
+                    captureState = 'saving';
+                    await saveCapturedFace(spokenName);
+                    return;
+                }
+
                 document.getElementById('voiceTranscript').innerHTML = `<p>🎤 You said: "${command}"</p>`;
                 
                 // Send to universal command processor
@@ -941,6 +967,17 @@
             wakeWordRecognition.onresult = async function(event) {
                 for (let i = event.resultIndex; i < event.results.length; i++) {
                     const text = event.results[i][0].transcript.toLowerCase();
+                    const fullText = event.results[i][0].transcript;
+
+                    // ---- CAPTURE NAME INTERCEPT ----
+                    // After voice-triggered capture, next utterance = the name
+                    if (captureState === 'waiting_name' && capturedImageData) {
+                        const spokenName = fullText.trim();
+                        document.getElementById('wakeStatus').innerHTML = `✅ Name heard: "${spokenName}"...`;
+                        captureState = 'saving';
+                        await saveCapturedFace(spokenName);
+                        break;
+                    }
                     
                     // Check for wake word variations
                     if (text.includes('my eye') || text.includes('my i') || text.includes('mai eye')) {
@@ -974,13 +1011,15 @@
             };
             
             wakeWordRecognition.onend = function() {
-                // Always restart to keep listening if in accessibility mode
+                // Only restart when in Accessibility Mode (Tab 2)
                 if (document.getElementById('tab2').classList.contains('active')) {
                     setTimeout(() => {
-                        try { 
-                            wakeWordRecognition.start(); 
-                            document.getElementById('wakeStatus').innerHTML = '👂 Always listening for "My Eye"...';
-                        } catch (e) {}
+                        if (wakeWordRecognition && captureState === 'idle') {
+                            try { 
+                                wakeWordRecognition.start();
+                                document.getElementById('wakeStatus').innerHTML = '👂 Always listening for "My Eye"...';
+                            } catch (e) {}
+                        }
                     }, 100);
                 }
             };
@@ -1197,6 +1236,13 @@
                         }
                         break;
                     
+                    // ===== CAPTURE FACE =====
+                    case 'start_capture':
+                        // Don't speak extra text here — startCaptureFromVoice handles it
+                        resultMessage = '';
+                        startCaptureFromVoice(isAccessibility);
+                        break;
+
                     // ===== DEFAULT =====
                     default:
                         if (data.answer) {
@@ -1227,6 +1273,256 @@
                 } else {
                     document.getElementById('voiceResponseText').innerHTML = errorMsg;
                 }
+            }
+        }
+
+        // Helper: speak text and return a promise that resolves when done
+        function speakAndWait(text) {
+            return new Promise(resolve => {
+                synth.cancel();
+                if (!text) { resolve(); return; }
+                const u = new SpeechSynthesisUtterance(text);
+                u.rate = 0.9;
+                u.onend = resolve;
+                u.onerror = resolve; // resolve even on error so flow doesn't hang
+                synth.speak(u);
+                // Safety fallback: resolve after 10 seconds in case onend never fires
+                setTimeout(resolve, 10000);
+            });
+        }
+
+        // Wait ms helper
+        function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        // ==================== VOICE-TRIGGERED CAPTURE ====================
+        // Called when 'My Eye capture image' is heard via voice command.
+        // Starts camera, waits, captures frame, then sets captureState so the
+        // EXISTING recognition stream picks up the name on the next utterance.
+        async function startCaptureFromVoice(isAccessibility) {
+            // 1. Start camera if not already on
+            if (!isCameraActive) {
+                synth.cancel();
+                synth.speak(new SpeechSynthesisUtterance('Starting camera. Be ready for photo.'));
+                await startCamera();
+                // Poll for video data up to 5s
+                for (let i = 0; i < 50; i++) {
+                    const v = document.getElementById('cameraFeed');
+                    if (v && v.videoWidth > 0) break;
+                    await wait(100);
+                }
+            } else {
+                synth.cancel();
+                synth.speak(new SpeechSynthesisUtterance('Be ready for photo.'));
+            }
+
+            const video = document.getElementById('cameraFeed');
+            if (!video || !video.videoWidth) {
+                synth.speak(new SpeechSynthesisUtterance('Camera failed to start. Please try again.'));
+                return;
+            }
+
+            // 2. Pause detection
+            if (detectionInterval) { clearInterval(detectionInterval); detectionInterval = null; }
+
+            // 3. Wait 2s then capture frame (gives time for 'be ready' TTS to finish)
+            await wait(2000);
+
+            const canvas = document.getElementById('cameraCanvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            capturedImageData = canvas.toDataURL('image/jpeg', 0.92);
+            captureState = 'waiting_name';
+
+            // 4. UI feedback
+            document.getElementById('descriptionText').innerHTML = '📸 Face captured! Say the name now...';
+            if (isAccessibility) {
+                document.getElementById('wakeStatus').innerHTML = '🎤 Say the name now (no \'My Eye\' needed)...';
+                document.getElementById('accessibilityResponseText').innerHTML = '📸 Face captured! Say the name now.';
+            } else {
+                document.getElementById('voiceTranscript').innerHTML = '<p>📸 Say the name now</p>';
+                document.getElementById('voiceStatus').innerHTML = '🎤 Say name...';
+                document.getElementById('listeningIndicator').classList.add('active');
+            }
+
+            // 5. Speak the name prompt — the existing recognition will catch the reply
+            synth.cancel();
+            const u = new SpeechSynthesisUtterance('Face captured. Say the name now.');
+            u.rate = 0.95;
+            synth.speak(u);
+
+            // 6. For Standard tab: restart recognition so it's ready to catch the name
+            if (!isAccessibility) {
+                await wait(2200); // wait for TTS to finish (~2s for that sentence)
+                try {
+                    if (!isListening && recognition) {
+                        recognition.start();
+                        isListening = true;
+                    }
+                } catch(e) { console.log('Recognition restart:', e); }
+            }
+            // For Accessibility tab: wakeWordRecognition is already running continuously
+            // — captureState intercept above will grab the next utterance automatically
+        }
+
+        // ==================== CAPTURE FACE FLOW ====================
+        // KEY FIX: Chrome requires SpeechRecognition.start() to be called
+        // SYNCHRONOUSLY inside a click handler. After any await, Chrome throws
+        // "not-allowed". So we: 1) capture frame, 2) start mic SYNC, 3) then TTS.
+
+        function startCaptureFlow() {
+            const video = document.getElementById('cameraFeed');
+
+            // If camera not on, tell user to start it first (can't await here)
+            if (!isCameraActive || !video || !video.videoWidth) {
+                synth.cancel();
+                synth.speak(new SpeechSynthesisUtterance('Please start the camera first, then press Capture Face.'));
+                document.getElementById('descriptionText').innerHTML = '⚠️ Start camera first!';
+                return;
+            }
+
+            // 1) PAUSE detection immediately
+            if (detectionInterval) { clearInterval(detectionInterval); detectionInterval = null; }
+            if (recognition) { try { recognition.stop(); } catch(e) {} isListening = false; }
+            if (nameRecognition) { try { nameRecognition.abort(); } catch(e) {} nameRecognition = null; }
+
+            // 2) Capture the frame right now
+            const canvas = document.getElementById('cameraCanvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            capturedImageData = canvas.toDataURL('image/jpeg', 0.92);
+            captureState = 'waiting_name';
+
+            // 3) Set up the name-recognition object BEFORE any async work
+            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SR) {
+                alert('Speech recognition not supported in this browser (need Chrome/Edge).');
+                captureState = 'idle'; capturedImageData = null;
+                if (isCameraActive) startDetection();
+                return;
+            }
+
+            nameRecognition = new SR();
+            nameRecognition.lang = 'en-IN';          // Indian English – better for names like Prince, Shriya
+            nameRecognition.continuous = false;
+            nameRecognition.interimResults = false;
+            nameRecognition.maxAlternatives = 5;      // autocorrect: pick highest-confidence result
+
+            nameRecognition.onresult = function(event) {
+                // Use first result (highest confidence) — that's the autocorrect
+                const spokenName = event.results[0][0].transcript.trim();
+                document.getElementById('voiceTranscript').innerHTML =
+                    `<p>🎤 Name: "<strong>${spokenName}</strong>"</p>`;
+                document.getElementById('voiceStatus').innerHTML = 'Saving...';
+                document.getElementById('listeningIndicator').classList.remove('active');
+                nameRecognition = null;
+                captureState = 'saving';
+                saveCapturedFace(spokenName);
+            };
+
+            nameRecognition.onerror = function(e) {
+                console.error('Name mic error:', e.error);
+                document.getElementById('voiceStatus').innerHTML = 'Idle';
+                document.getElementById('listeningIndicator').classList.remove('active');
+                captureState = 'idle'; capturedImageData = null; nameRecognition = null;
+                if (isCameraActive) startDetection();
+                synth.cancel();
+                synth.speak(new SpeechSynthesisUtterance('Could not hear the name. Press Capture Face and try again.'));
+            };
+
+            nameRecognition.onend = function() {
+                document.getElementById('listeningIndicator').classList.remove('active');
+                document.getElementById('voiceStatus').innerHTML = 'Idle';
+                if (captureState === 'waiting_name') {
+                    // No result came — reset
+                    captureState = 'idle'; capturedImageData = null;
+                    if (isCameraActive) startDetection();
+                }
+            };
+
+            // 4) START MIC NOW — still sync inside click handler (Chrome allows this)
+            try {
+                nameRecognition.start();
+                console.log('✅ Name mic started');
+            } catch(err) {
+                console.error('Mic start failed:', err);
+                captureState = 'idle'; capturedImageData = null; nameRecognition = null;
+                if (isCameraActive) startDetection();
+                synth.speak(new SpeechSynthesisUtterance('Microphone error. Please allow microphone access.'));
+                return;
+            }
+
+            // 5) UI feedback
+            document.getElementById('descriptionText').innerHTML = '📸 Face captured! 🎤 Say the name now...';
+            document.getElementById('voiceTranscript').innerHTML = '<p>🎤 Say the person\'s name now</p>';
+            document.getElementById('voiceStatus').innerHTML = '🎤 Listening for name...';
+            document.getElementById('listeningIndicator').classList.add('active');
+
+            // 6) Speak TTS prompt AFTER mic is already open (300ms delay so mic is ready)
+            //    The speaking happens while recognition is running — user says name after TTS ends
+            setTimeout(() => {
+                synth.cancel();
+                const u = new SpeechSynthesisUtterance('Face captured. Say the name.');
+                u.rate = 1.1;  // slightly faster so mic time isn't wasted
+                synth.speak(u);
+            }, 300);
+        }
+
+        // Step 2: POST image + name → save to known_faces/, stop camera, speak confirmation
+        async function saveCapturedFace(name) {
+            if (!capturedImageData || !name) {
+                captureState = 'idle';
+                if (isCameraActive) startDetection();
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/capture-face', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ image_data: capturedImageData, name: name })
+                });
+
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    const msg = (data.message || `Face saved for ${name}`) + '. Camera stopped. Say recognize face when ready.';
+                    document.getElementById('descriptionText').innerHTML = `✅ ${data.message || 'Face saved for ' + name}`;
+                    document.getElementById('voiceResponseText').innerHTML = data.message || `Face saved for ${name}`;
+                    document.getElementById('voiceResponse').style.display = 'block';
+
+                    // Stop camera so user knows face was captured
+                    stopCamera();
+
+                    synth.cancel();
+                    const u = new SpeechSynthesisUtterance(msg);
+                    u.rate = 0.9;
+                    synth.speak(u);
+                } else if (data.status === 'no_face') {
+                    // No face detected — tell user to reposition, don't waste the name
+                    document.getElementById('descriptionText').innerHTML = '⚠️ No face detected! Please reposition.';
+                    synth.cancel();
+                    synth.speak(new SpeechSynthesisUtterance(data.message));
+                    // Reset state so user can try capture again
+                    captureState = 'idle';
+                    capturedImageData = null;
+                    return; // skip finally cleanup below
+                } else {
+                    const errMsg = 'Could not save the face. Please try again.';
+                    document.getElementById('descriptionText').innerHTML = `❌ ${data.message || errMsg}`;
+                    synth.cancel();
+                    synth.speak(new SpeechSynthesisUtterance(errMsg));
+                    if (isCameraActive) startDetection();
+                }
+            } catch (err) {
+                console.error('Save face error:', err);
+                synth.cancel();
+                synth.speak(new SpeechSynthesisUtterance('Network error while saving. Please try again.'));
+                if (isCameraActive) startDetection();
+            } finally {
+                captureState = 'idle';
+                capturedImageData = null;
             }
         }
 
@@ -1606,12 +1902,10 @@
             document.getElementById('startVoiceBtn').addEventListener('click', startListening);
             document.getElementById('stopVoiceBtn').addEventListener('click', stopListening);
             
-            // Wake word button - just starts the listening (visual feedback only)
+            // Wake word button (Accessibility Mode only)
             document.getElementById('wakeWordBtn').addEventListener('click', () => {
                 document.getElementById('accessibilityResponse').style.display = 'none';
-                if (!wakeWordRecognition) {
-                    initWakeWordRecognition();
-                }
+                if (!wakeWordRecognition) initWakeWordRecognition();
                 startWakeWordListening();
                 synth.speak(new SpeechSynthesisUtterance("I'm always listening. Just say 'My Eye' followed by your command."));
             });
@@ -1622,7 +1916,7 @@
             
             // Welcome message
             setTimeout(() => {
-                synth.speak(new SpeechSynthesisUtterance('VisionAssist ready. In Accessibility Mode, just say "My Eye" followed by any command.'));
+                synth.speak(new SpeechSynthesisUtterance('VisionAssist ready. Switch to Accessibility Mode and say "My Eye" followed by any command.'));
             }, 2000);
         });
 
